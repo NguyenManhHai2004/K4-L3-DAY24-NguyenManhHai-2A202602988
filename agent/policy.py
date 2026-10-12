@@ -34,7 +34,13 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+CLASSIFICATIONS = ("public", "internal", "restricted")
 
 
 @dataclass(frozen=True)
@@ -51,5 +57,66 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def _load_principals() -> dict:
+    return json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8"))
+
+
+def _expired(expires_at: str) -> bool | None:
+    """True nếu đã hết hạn, False nếu còn hạn, None nếu không đọc được."""
+    try:
+        deadline = datetime.fromisoformat(expires_at)
+    except (TypeError, ValueError):
+        return None
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return deadline <= datetime.now(timezone.utc)
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Trả (allow, reason); reason luôn có nội dung. Mặc định đóng: thiếu hoặc
+    sai bất kỳ điều kiện nào đều deny."""
+    # 1. Nhãn dữ liệu phải hợp lệ.
+    if context.data_classification not in CLASSIFICATIONS:
+        return False, f"deny: data_classification {context.data_classification!r} không hợp lệ"
+
+    # 2. Rule tối thiểu — đặt trước OBO nên không principal nào (kể cả dpo) vượt được.
+    if context.data_classification == "restricted" and context.egress_enabled is True:
+        return False, "deny: dữ liệu restricted không được đi cùng egress (network) trong cùng một run"
+
+    # 3. OBO: người ra lệnh, tool, phạm vi quyền, mục đích, thời hạn.
+    try:
+        principals = _load_principals()
+    except (OSError, ValueError):
+        return False, "deny: không đọc được data/principals.json nên không xác định được principal"
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, f"deny: principal {context.principal_id!r} không có trong data/principals.json"
+
+    if not context.requested_tool:
+        return False, "deny: thiếu requested_tool"
+
+    expired = _expired(context.expires_at)
+    if expired is None:
+        return False, "deny: expires_at thiếu hoặc không phải ISO-8601"
+    if expired:
+        return False, f"deny: run đã hết hạn lúc {context.expires_at}"
+
+    if context.delegation_depth < 0:
+        return False, f"deny: delegation_depth {context.delegation_depth} không hợp lệ"
+
+    effective = set(principal.get("allowed_tools", ())) & set(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective &= set(context.parent_scopes)
+    if context.requested_tool not in effective:
+        return False, (f"deny: {context.requested_tool!r} nằm ngoài quyền hiệu lực của "
+                       f"{context.principal_id!r} (principal ∩ agent"
+                       f"{' ∩ parent' if context.delegation_depth > 0 else ''} scopes)")
+
+    if context.request_purpose not in principal.get("purposes", ()):
+        return False, (f"deny: mục đích {context.request_purpose!r} không nằm trong "
+                       f"purposes của {context.principal_id!r}")
+
+    # 4. Mọi điều kiện đều hợp lệ.
+    return True, (f"allow: {context.principal_id} được dùng {context.requested_tool} "
+                  f"cho {context.request_purpose} (classification={context.data_classification}, "
+                  f"egress={context.egress_enabled})")
