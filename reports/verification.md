@@ -17,3 +17,13 @@
   - Số 12 chữ số bất kỳ (mã đơn, mã giao dịch) có thể bị báo nhầm là CCCD.
   - Tên người (PERSON) chưa được xử lý; test set không có nhãn này.
   - Test set là dữ liệu tổng hợp theo mẫu cố định nên điểm 1.000 cao hơn mức dự kiến trên dữ liệu thật.
+
+## CP3e — Ledger (`agent/ledger.py`, `reports/ledger.jsonl`)
+
+- Unit test: `python -m pytest tests/test_ledger.py -v --basetemp=.pytest_tmp` → 3 pass (chuỗi hash, phát hiện sửa dòng, thiếu `reason`).
+- Tạo ledger thật: `python -m agent.loop --mock --as dpo "Tổng hợp các ticket còn mở tuần này"` → `reports/ledger.jsonl` 24 dòng (1 `search_docs` allow, 22 `read_customer` allow, 1 `http_post` deny).
+- Kiểm: `python -c "from agent.ledger import verify; from pathlib import Path; print(verify(Path('reports/ledger.jsonl')))"` → `True`.
+- Dòng `http_post` deny: `on_behalf_of=dpo`, `classification=restricted`, `reason="deny: dữ liệu restricted không được đi cùng egress (network) trong cùng một run"`.
+- Chứng minh phát hiện sửa đổi (làm trên bản sao, không đụng file thật): sửa một ký tự (`allow` → `denx`) ở dòng 13/24 mà không tính lại hash → `verify()` trả `False`; bản sao nguyên vẹn và ledger thật vẫn `True`.
+- Không có PII trong ledger: chỉ lưu `args_hash` (sha256 của tham số); không có `KH-`/`cccd` nào trong file.
+- Giới hạn: hash chain trong một file không phát hiện được việc xoá dòng cuối hoặc viết lại cả file rồi tính lại chuỗi, vì lab không có mốc tin cậy bên ngoài.
