@@ -1,10 +1,31 @@
 # Verification — điền trước khi nộp
 
-- OS / Python / Gitleaks version:
-- `python -m pytest tests/ -q`:
-- `pre-commit run --all-files`:
-- Ledger verify:
-- Các lỗi còn lại:
+- **OS / Python / Gitleaks:** Windows 10 Pro 10.0.19045 / Python 3.11.9 / Gitleaks 8.30.1 (tải từ release chính thức, SHA256 khớp `checksums.txt`).
+- **`python -m pytest tests/ -q --basetemp=.pytest_tmp`:** `33 passed`, 0 skipped, 0 failed (reset sink trước khi chạy).
+- **`pre-commit run --all-files`:** `Detect hardcoded secrets...Passed`.
+- **Ledger verify:** `python -c "from agent.ledger import verify; from pathlib import Path; print(verify(Path('reports/ledger.jsonl')))"` → `True`. Sửa một ký tự ở dòng giữa của bản sao → `False` (ledger thật không bị sửa).
+- **`reports/attack-before.log`:** 4 dòng POST chứa hồ sơ giả `KH-000999` (1196 byte). **`reports/attack-after.log`:** **0 byte**.
+- **Các lỗi còn lại / giới hạn:** không có test fail hay skip. Giới hạn của lab: mock LLM, principal giả lập (không xác thực), regex PII chỉ 4 loại, hash chain không chống cắt đuôi, chưa thử model thật. Điều khoản pháp luật cụ thể trong `compliance-mapping.md` ghi là *chưa xác minh* vì chưa đọc toàn văn.
+
+## Lỗi đã gặp và cách sửa
+
+- `gitleaks` không nhận ra trong terminal đã mở: PATH người dùng chỉ có hiệu lực ở terminal mới; nạp lại PATH hoặc mở lại VS Code.
+- `sink.py --reset` báo `UnicodeEncodeError` (cp1252): đặt `PYTHONIOENCODING=utf-8` (log vẫn được reset trước khi in).
+- Script replay nằm ngoài repo báo `No module named 'agent'`: đặt `PYTHONPATH` về thư mục repo.
+- `attack-before.log` từng có 5 dòng (chạy CLI mà chưa reset): reset và chạy lại đúng 4 lure → 4 dòng.
+- Chuỗi `
+` bị ghi thành xuống dòng thật khi sinh code (`SyntaxError`): sửa lại literal trong `agent/ledger.py` và `agent/runner.py`.
+- `.venv/` gây false positive `generic-api-key` khi quét file hiện tại: thêm allowlist đúng đường dẫn `.venv/`, không đụng rule token giả.
+- `attack-before.log`, `attack-after.log`, `ledger.jsonl` bị `.gitignore` chặn: thêm vào commit bằng `git add -f`.
+
+## Lệnh và kết quả theo checkpoint
+
+- **CP1:** đọc `agent/loop.py`, `agent/tools.py` → `reports/baseline.md` (3 câu có `file:dòng`); không có test.
+- **CP2:** `python -m agent.check_lure corpus/ticket-90*.md` → `4/4 lure sẵn sàng`; replay baseline bằng `_naive_loop` → `reports/attack-before.log` 4 dòng.
+- **CP3b:** `python -m pytest tests/test_policy.py -v --basetemp=.pytest_tmp` → 4 pass.
+- **CP3c:** `python -m pytest tests/test_obo.py -v --basetemp=.pytest_tmp` → 5 pass (`support_l1` deny, `dpo` allow).
+- **CP3d:** `python -m pytest tests/test_split.py -v ...` → 1 pass; `python -m pytest tests/test_injection.py -v ...` → 8 pass (4 lure x 2 principal, không SKIP).
+- **CP5:** reset sink, chạy toàn bộ test (33 pass), reset lại, bật sink thật, chạy `python -m agent.loop --mock --as dpo "Tổng hợp các ticket còn mở tuần này"` → `attack-after.log` 0 byte. Ledger có thêm 24 dòng (tổng 48): 1 `search_docs` allow, 22 `read_customer` allow, 1 `http_post` deny (`on_behalf_of=dpo`, `reason` restricted + egress).
 
 ## CP3a — PII gate (`agent/pii.py`)
 
