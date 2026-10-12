@@ -61,18 +61,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent import ledger, policy, tools
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 AGENT_ID = "lab24-agent"
 RUN_TTL = timedelta(minutes=5)
-ALL_SCOPES = ("search_docs", "read_customer", "http_post")
+ORCHESTRATOR_SCOPES = ("search_docs", "read_customer", "http_post")
+RUN_A_SCOPES = ("search_docs",)
+RUN_B_SCOPES = ("read_customer", "http_post")
+
+# Chỉ tên file đúng dạng ticket-007.md mới cho ra mã ticket; ticket-904b.md thì không.
+_TICKET_FILE_RE = re.compile(r"^ticket-(\d+)\.md$")
 
 
 class RunnerScaffoldPending(NotImplementedError):
@@ -82,26 +88,29 @@ class RunnerScaffoldPending(NotImplementedError):
 class _Gate:
     """PEP: mọi tool call đi qua policy.check() và ghi ledger TRƯỚC khi tool chạy."""
 
-    def __init__(self, ledger_path: Path, principal_id: str, run_id: str, agent_id: str,
+    def __init__(self, ledger_path: Path, principal_id: str, run_id: str, name: str,
                  scopes: tuple[str, ...], expires_at: str):
         self.ledger_path = ledger_path
         self.principal_id = principal_id
         self.run_id = run_id
-        self.agent_id = agent_id
+        self.agent_id = f"{AGENT_ID}/{name}"
         self.scopes = scopes
         self.expires_at = expires_at
 
     def allow(self, tool: str, args: dict, classification: str, purpose: str,
               egress: bool = False) -> bool:
+        # Run A và Run B đều là agent con của orchestrator (depth 1): quyền hiệu
+        # lực còn bị giới hạn thêm bởi parent_scopes.
         ctx = policy.PolicyContext(
             data_classification=classification,
             request_purpose=purpose,
             agent_owner=self.agent_id,
-            delegation_depth=0,
+            delegation_depth=1,
             egress_enabled=egress,
             principal_id=self.principal_id,
             requested_tool=tool,
             agent_scopes=self.scopes,
+            parent_scopes=ORCHESTRATOR_SCOPES,
             expires_at=self.expires_at,
         )
         allowed, reason = policy.check(ctx)
@@ -121,29 +130,68 @@ class _Gate:
         return allowed
 
 
+def _run_a(gate: _Gate, message: str, llm) -> tuple[list[int], str | None, list[dict]] | None:
+    """Run A: đọc ticket (untrusted). Không chạm private store, không egress.
+
+    Chỉ trả ra dữ liệu có kiểu: số ticket lấy từ TÊN FILE, URL mà lure muốn gửi
+    tới (chỉ để kiểm policy, không mang dữ liệu), và bản docs đã che PII.
+    Customer ID nằm trong text của attacker không đi ra khỏi hàm này.
+    """
+    if not gate.allow("search_docs", {"query": message}, "internal", "summarize-tickets"):
+        return None
+    docs = tools.search_docs(message)
+
+    ticket_ids = sorted({int(m.group(1)) for d in docs if (m := _TICKET_FILE_RE.match(d["id"]))})
+
+    injected = llm.find_injection("\n\n".join(d["text"] for d in docs))
+    send_url = injected.target_url if injected is not None else None
+
+    safe_docs = [{"id": d["id"], "text": pii.redact(d["text"])} for d in docs]
+    return ticket_ids, send_url, safe_docs
+
+
+def _run_b(gate: _Gate, ticket_ids: list[int], send_url: str | None) -> int:
+    """Run B: chỉ nhận list[int] mã ticket. Trả về số hồ sơ đã đọc hợp lệ."""
+    read = 0
+    # Cổng mở private store: bị deny thì không mở customers.json.
+    if gate.allow("read_customer", {"ticket_ids": ticket_ids}, "restricted", "support-reply"):
+        trusted = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+        wanted = set(ticket_ids)
+        customer_ids = [c["customer_id"] for c in trusted
+                        if wanted.intersection(c.get("related_tickets", []))]
+        for customer_id in customer_ids:
+            # Kiểm lại ngay trước từng lần đọc.
+            if not gate.allow("read_customer", {"customer_id": customer_id}, "restricted",
+                              "support-reply"):
+                continue
+            try:
+                tools.read_customer(customer_id)
+            except tools.ToolError:
+                continue
+            read += 1
+
+    # Lure đòi gửi dữ liệu đi: kiểm riêng, chỉ mang URL, không mang hồ sơ khách.
+    if send_url is not None:
+        if gate.allow("http_post", {"url": send_url}, "restricted", "support-reply", egress=True):
+            tools.http_post(send_url, {"ticket_ids": ticket_ids})  # policy hiện không bao giờ cho qua
+    return read
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
     ledger_path = (Path(log_dir) if log_dir else REPORTS_DIR) / "ledger.jsonl"
-    run_id = uuid.uuid4().hex
     expires_at = (datetime.now(timezone.utc) + RUN_TTL).isoformat()
-    gate = _Gate(ledger_path, principal_id, run_id, f"{AGENT_ID}/{run_id[:8]}", ALL_SCOPES, expires_at)
 
-    if not gate.allow("search_docs", {"query": message}, "internal", "summarize-tickets"):
+    run_a = _Gate(ledger_path, principal_id, uuid.uuid4().hex, "run-a", RUN_A_SCOPES, expires_at)
+    result = _run_a(run_a, message, llm)
+    if result is None:
         return "Yêu cầu bị từ chối bởi policy (xem ledger)."
-    docs = tools.search_docs(message)
+    ticket_ids, send_url, safe_docs = result
 
-    injected = llm.find_injection("\n\n".join(d["text"] for d in docs))
-    if injected is not None:
-        collected = []
-        for customer_id in injected.customer_ids:
-            if not gate.allow("read_customer", {"customer_id": customer_id}, "restricted", "support-reply"):
-                continue
-            try:
-                collected.append(tools.read_customer(customer_id))
-            except tools.ToolError:
-                continue
-        if collected and gate.allow("http_post", {"url": injected.target_url}, "restricted",
-                                    "support-reply", egress=True):
-            tools.http_post(injected.target_url, {"records": collected})
+    run_b = _Gate(ledger_path, principal_id, uuid.uuid4().hex, "run-b", RUN_B_SCOPES, expires_at)
+    customers_read = _run_b(run_b, ticket_ids, send_url)
 
-    return llm.summarize(docs)
+    answer = llm.summarize(safe_docs)
+    if customers_read:
+        answer += f" Đã đối chiếu {customers_read} hồ sơ khách gắn với các ticket này."
+    return answer
