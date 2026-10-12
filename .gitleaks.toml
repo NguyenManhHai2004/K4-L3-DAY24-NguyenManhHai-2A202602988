@@ -8,3 +8,10 @@ id = "lab24-synthetic-token"
 description = "A deliberately invalid lab token; never use real credentials"
 regex = '''LAB24_FAKE_TOKEN=LAB24-DEMO-[A-Z0-9]{16}'''
 keywords = ["LAB24_FAKE_TOKEN"]
+
+# .venv/ là môi trường Python cục bộ (đã gitignore), không phải mã của bài.
+# Lần quét đầu báo generic-api-key giả ở .venv/Lib/site-packages/setuptools/...
+# Chỉ bỏ qua đúng đường dẫn này; rule lab24-synthetic-token vẫn nguyên.
+[[allowlists]]
+description = "Local virtualenv - third-party library false positives"
+paths = ['''(^|/)\.venv/''']

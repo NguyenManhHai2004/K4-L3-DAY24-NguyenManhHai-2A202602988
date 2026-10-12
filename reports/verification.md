@@ -27,3 +27,12 @@
 - Chứng minh phát hiện sửa đổi (làm trên bản sao, không đụng file thật): sửa một ký tự (`allow` → `denx`) ở dòng 13/24 mà không tính lại hash → `verify()` trả `False`; bản sao nguyên vẹn và ledger thật vẫn `True`.
 - Không có PII trong ledger: chỉ lưu `args_hash` (sha256 của tham số); không có `KH-`/`cccd` nào trong file.
 - Giới hạn: hash chain trong một file không phát hiện được việc xoá dòng cuối hoặc viết lại cả file rồi tính lại chuỗi, vì lab không có mốc tin cậy bên ngoài.
+
+## CP4 — Supply chain & secrets
+
+- Phiên bản: Python 3.11.9, Gitleaks 8.30.1 (`gitleaks version`).
+- `gitleaks git --config .gitleaks.toml --redact --verbose .` → 11 commit, 1 finding (`lab24-synthetic-token`, `lab-fake-secret.txt:1`, commit `1bdd849`), mã thoát 1 (đúng mong đợi).
+- `gitleaks dir --config .gitleaks.toml --redact .`: lần đầu 1 finding false positive `generic-api-key` trong `.venv/Lib/site-packages/setuptools/...`; thêm allowlist đúng đường dẫn `.venv/` vào `.gitleaks.toml`, quét lại → `no leaks found`, mã thoát 0. Chi tiết trong `reports/secrets-incident.md`.
+- `python -m piptools compile --generate-hashes -o requirements.lock requirements.txt` → 11 package, mỗi package có `--hash=sha256:` (192 hash). `python -m pip install --require-hashes -r requirements.lock` → thành công.
+- `pre-commit install` → ok; `pre-commit run --all-files` → `Detect hardcoded secrets...Passed`.
+- `python -m pytest tests/test_supply_chain.py -v --basetemp=.pytest_tmp` → 3 pass.
