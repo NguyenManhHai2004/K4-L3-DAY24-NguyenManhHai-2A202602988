@@ -59,16 +59,91 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+
+AGENT_ID = "lab24-agent"
+RUN_TTL = timedelta(minutes=5)
+ALL_SCOPES = ("search_docs", "read_customer", "http_post")
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+class _Gate:
+    """PEP: mọi tool call đi qua policy.check() và ghi ledger TRƯỚC khi tool chạy."""
+
+    def __init__(self, ledger_path: Path, principal_id: str, run_id: str, agent_id: str,
+                 scopes: tuple[str, ...], expires_at: str):
+        self.ledger_path = ledger_path
+        self.principal_id = principal_id
+        self.run_id = run_id
+        self.agent_id = agent_id
+        self.scopes = scopes
+        self.expires_at = expires_at
+
+    def allow(self, tool: str, args: dict, classification: str, purpose: str,
+              egress: bool = False) -> bool:
+        ctx = policy.PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=self.agent_id,
+            delegation_depth=0,
+            egress_enabled=egress,
+            principal_id=self.principal_id,
+            requested_tool=tool,
+            agent_scopes=self.scopes,
+            expires_at=self.expires_at,
+        )
+        allowed, reason = policy.check(ctx)
+        ledger.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": self.agent_id,
+            "run_id": self.run_id,
+            "on_behalf_of": self.principal_id,
+            "expires_at": self.expires_at,
+            "tool": tool,
+            "args_hash": hashlib.sha256(
+                json.dumps(args, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+        }, self.ledger_path)
+        return allowed
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) if log_dir else REPORTS_DIR) / "ledger.jsonl"
+    run_id = uuid.uuid4().hex
+    expires_at = (datetime.now(timezone.utc) + RUN_TTL).isoformat()
+    gate = _Gate(ledger_path, principal_id, run_id, f"{AGENT_ID}/{run_id[:8]}", ALL_SCOPES, expires_at)
+
+    if not gate.allow("search_docs", {"query": message}, "internal", "summarize-tickets"):
+        return "Yêu cầu bị từ chối bởi policy (xem ledger)."
+    docs = tools.search_docs(message)
+
+    injected = llm.find_injection("\n\n".join(d["text"] for d in docs))
+    if injected is not None:
+        collected = []
+        for customer_id in injected.customer_ids:
+            if not gate.allow("read_customer", {"customer_id": customer_id}, "restricted", "support-reply"):
+                continue
+            try:
+                collected.append(tools.read_customer(customer_id))
+            except tools.ToolError:
+                continue
+        if collected and gate.allow("http_post", {"url": injected.target_url}, "restricted",
+                                    "support-reply", egress=True):
+            tools.http_post(injected.target_url, {"records": collected})
+
+    return llm.summarize(docs)
