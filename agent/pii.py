@@ -30,10 +30,42 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+# Thứ tự = độ ưu tiên khi hai vùng chồng nhau: email và tài khoản có nhãn
+# (STK/số tài khoản) thắng CCCD, CCCD thắng số điện thoại. Nhờ vậy STK 12 số
+# không bị báo thêm lần nữa thành CCCD.
+_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
+    ("EMAIL", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"), 0),
+    # Chỉ lấy phần chữ số (group 1); nhãn đi trước để tránh báo nhầm mọi dãy số dài.
+    ("VN_BANK_ACCOUNT",
+     re.compile(r"(?:STK|số\s+tài\s+khoản|so\s+tai\s+khoan|tài\s+khoản|TK)\s*[:\-]?\s*(\d{8,16})(?!\d)",
+                re.IGNORECASE), 1),
+    ("VN_CCCD", re.compile(r"(?<![\d.])\d{12}(?![\d.]*\d)"), 0),
+    # 0 + 9 chữ số, cho phép dấu cách/chấm/gạch ngang; hoặc +84/84 thay số 0 đầu.
+    ("VN_PHONE", re.compile(r"(?<!\d)(?:\+?84|0)(?:[ .-]?\d){9}(?!\d)"), 0),
+]
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates = []
+    for priority, (kind, pattern, group) in enumerate(_PATTERNS):
+        for m in pattern.finditer(text):
+            start, end = m.span(group)
+            if kind == "VN_PHONE" and len(re.sub(r"\D", "", m.group())) not in (10, 11):
+                continue
+            candidates.append((priority, start, end, kind))
+
+    entities: list[dict] = []
+    for _, start, end, kind in sorted(candidates):
+        if any(start < e["end"] and e["start"] < end for e in entities):
+            continue  # vùng đã được loại ưu tiên cao hơn lấy
+        entities.append({"type": kind, "start": start, "end": end})
+    return sorted(entities, key=lambda e: e["start"])
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    # Thay từ cuối về đầu để offset của các vùng chưa xử lý không bị lệch.
+    for e in reversed(detect(text)):
+        text = text[: e["start"]] + f"[REDACTED_{e['type']}]" + text[e["end"]:]
+    return text
